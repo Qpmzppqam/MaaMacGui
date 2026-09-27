@@ -150,11 +150,12 @@ private class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        // 点击 Dock 图标：取消隐藏并重新显示窗口（窗口此前只是被隐藏，并未销毁）
+        // 点击 Dock 图标：取消隐藏 App 并只重新显示主窗口（窗口此前只是被隐藏，并未销毁）。
+        // 仅恢复 delegate 为 WindowCloseDelegate 的主窗口，避免把「设置」等辅助窗口一并带出。
         if !flag {
             NSApp.unhide(nil)
-            for window in sender.windows {
-                window.makeKeyAndOrderFront(self)
+            if let mainWindow = sender.windows.first(where: { $0.delegate is WindowCloseDelegate }) {
+                mainWindow.makeKeyAndOrderFront(self)
             }
         }
         return true
