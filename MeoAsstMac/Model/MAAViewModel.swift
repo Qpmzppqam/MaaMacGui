@@ -9,6 +9,7 @@ import AppKit
 import Combine
 import Foundation
 import IOKit.pwr_mgt
+import OSLog
 import SwiftUI
 import UserNotifications
 
@@ -143,9 +144,13 @@ import UserNotifications
     /// 任务通知提醒开关：开启后任务完成 / 出错 / 掉线等事件会发送系统通知。
     @AppStorage("MAAUseNotification") var useNotification = true {
         didSet {
-            // 用户重新开启时惰性请求系统通知授权（拒绝过后再开启也能重新弹窗）。
+            let center = MAANotificationCenter.shared
             if useNotification {
-                MAANotificationCenter.shared.requestAuthorizationIfNeeded()
+                // 用户重新开启时惰性请求系统通知授权（拒绝过后再开启也能重新弹窗）。
+                center.requestAuthorizationIfNeeded()
+            } else {
+                // 用户关闭提醒时移除已排程的「理智恢复」定时通知，避免关闭后仍在触发。
+                center.removePendingSanityRecovery()
             }
         }
     }
@@ -766,11 +771,21 @@ final class MAANotificationCenter: NSObject {
     /// 理智恢复定时通知的固定标识符：便于后续按"同类"精确移除 / 覆盖，而不影响其它通知。
     private static let sanityRecoveryIdentifier = "MAA.SanityRecovery"
 
+    /// 通知相关日志（OSLog 为值类型且 Sendable，可在任意线程 / 回调中安全使用）。
+    private static let logger = Logger(subsystem: "com.hguandl.MeoAsstMac", category: "MAANotificationCenter")
+
     private let center = UNUserNotificationCenter.current()
 
     private override init() {
         super.init()
         center.delegate = self
+    }
+
+    /// 移除所有已排程的「理智恢复」定时通知。用于用户关闭「任务通知提醒」时清理残留预约。
+    func removePendingSanityRecovery() {
+        // removePendingNotificationRequests 可安全地在任意线程调用。
+        UNUserNotificationCenter.current()
+            .removePendingNotificationRequests(withIdentifiers: [Self.sanityRecoveryIdentifier])
     }
 
     /// 惰性请求通知授权：仅当状态为 `.notDetermined` 时弹窗，已授权 / 已拒绝均为空操作。
@@ -809,7 +824,11 @@ final class MAANotificationCenter: NSObject {
                 content: content,
                 trigger: nil
             )
-            center.add(request)
+            center.add(request) { error in
+                if let error {
+                    Self.logger.error("Failed to post notification: \(error.localizedDescription)")
+                }
+            }
         }
     }
 
@@ -846,7 +865,11 @@ final class MAANotificationCenter: NSObject {
                 content: content,
                 trigger: trigger
             )
-            center.add(request)
+            center.add(request) { error in
+                if let error {
+                    Self.logger.error("Failed to schedule sanity recovery notification: \(error.localizedDescription)")
+                }
+            }
         }
     }
 }
