@@ -104,6 +104,10 @@ private class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 初始化通知中心（设置 delegate，使应用在前台时也会展示系统通知）
+        _ = MAANotificationCenter.shared
+        // 惰性请求系统通知授权（仅首次弹窗，已授权 / 已拒绝均为空操作）
+        MAANotificationCenter.shared.requestAuthorizationIfNeeded()
         // 等 SwiftUI 创建好主窗口后再接管其关闭事件
         installMainWindowCloseDelegate()
     }

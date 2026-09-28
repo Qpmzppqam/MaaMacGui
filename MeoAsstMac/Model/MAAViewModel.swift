@@ -5,9 +5,12 @@
 //  Created by hguandl on 13/4/2023.
 //
 
+import AppKit
 import Combine
+import Foundation
 import IOKit.pwr_mgt
 import SwiftUI
+import UserNotifications
 
 @MainActor class MAAViewModel: ObservableObject {
     // MARK: - Core Status
@@ -135,6 +138,33 @@ import SwiftUI
         didSet {
             NotificationCenter.default.post(name: .MAAPreventSystemSleepingChanged, object: preventSystemSleeping)
         }
+    }
+
+    /// 任务通知提醒开关：开启后任务完成 / 出错 / 掉线等事件会发送系统通知。
+    @AppStorage("MAAUseNotification") var useNotification = true {
+        didSet {
+            // 用户重新开启时惰性请求系统通知授权（拒绝过后再开启也能重新弹窗）。
+            if useNotification {
+                MAANotificationCenter.shared.requestAuthorizationIfNeeded()
+            }
+        }
+    }
+
+    // MARK: - Task Notification
+
+    /// 发送一条本地任务通知，受 `useNotification` 开关控制。
+    func notify(title: LocalizedStringResource, body: String? = nil) {
+        guard useNotification else { return }
+        MAANotificationCenter.shared.post(title: String(localized: title), body: body)
+    }
+
+    /// 预约「理智恢复」提醒：任务全部完成时若还有剩余理智将在指定时间恢复，则触发定时通知。
+    func notifySanityRecovery(at date: Date) {
+        guard useNotification else { return }
+        MAANotificationCenter.shared.schedule(
+            title: String(localized: LocalizedStringResource("理智已恢复")),
+            body: String(localized: LocalizedStringResource("可以开始新一轮任务了")),
+            at: date)
     }
 
     // MARK: - Initializer
@@ -720,5 +750,119 @@ extension MAAViewModel {
     func stopGame() async throws {
         guard let client = await MaaToolClient(address: connectionAddress) else { return }
         try await client.terminate()
+    }
+}
+
+// MARK: - Notification
+
+/// 基于 `UserNotifications` 框架的本地任务通知实现，提供「任务通知提醒」能力
+/// （任务完成 / 出错 / 掉线 / 公招高稀有度等场景）。
+///
+/// 所有公开方法均应在主线程调用；内部对可能落到后台的回调（如授权结果）做了
+/// 主线程兜底，避免在非主线程触碰通知中心。
+final class MAANotificationCenter: NSObject {
+    static let shared = MAANotificationCenter()
+
+    /// 理智恢复定时通知的固定标识符：便于后续按"同类"精确移除 / 覆盖，而不影响其它通知。
+    private static let sanityRecoveryIdentifier = "MAA.SanityRecovery"
+
+    private let center = UNUserNotificationCenter.current()
+
+    private override init() {
+        super.init()
+        center.delegate = self
+    }
+
+    /// 惰性请求通知授权：仅当状态为 `.notDetermined` 时弹窗，已授权 / 已拒绝均为空操作。
+    /// 在 App 启动且用户开启「任务通知提醒」时调用即可，无需在每次投递前请求。
+    func requestAuthorizationIfNeeded() {
+        // 直接取单例，避免在 `@Sendable` 回调里捕获 `self`（本项目开启严格并发检查）。
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            guard settings.authorizationStatus == .notDetermined else { return }
+            DispatchQueue.main.async {
+                UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+            }
+        }
+    }
+
+    /// 立即推送一条通知。应用非活跃时由系统以横幅 + 声音展示；
+    /// 活跃时的展示行为由 `willPresent` 决定。
+    /// - Parameters:
+    ///   - title: 通知标题。
+    ///   - body: 通知正文，可选。
+    ///   - sound: 是否播放提示音，默认开启。
+    func post(title: String, body: String? = nil, sound: Bool = true) {
+        DispatchQueue.main.async {
+            // 取单例，避免在 `@Sendable` 闭包中捕获 `self`（严格并发检查）。
+            let center = UNUserNotificationCenter.current()
+            let content = UNMutableNotificationContent()
+            content.title = title
+            if let body, !body.isEmpty {
+                content.body = body
+            }
+            if sound {
+                content.sound = .default
+            }
+
+            let request = UNNotificationRequest(
+                identifier: UUID().uuidString,
+                content: content,
+                trigger: nil
+            )
+            center.add(request)
+        }
+    }
+
+    /// 预约一条定时通知（例如理智完全恢复时提醒）。只会移除此前同类的理智恢复通知，
+    /// 不会清掉其它定时通知，也不会因多次完成任务而互相取消。
+    /// - Parameters:
+    ///   - title: 通知标题。
+    ///   - body: 通知正文，可选。
+    ///   - date: 触发时间。
+    ///   - sound: 是否播放提示音，默认开启。
+    func schedule(title: String, body: String? = nil, at date: Date, sound: Bool = true) {
+        DispatchQueue.main.async {
+            // 取单例，避免在 `@Sendable` 闭包中捕获 `self`（严格并发检查）。
+            let center = UNUserNotificationCenter.current()
+            // 仅移除同类（理智恢复）通知，按固定标识符精确操作
+            center.removePendingNotificationRequests(withIdentifiers: [Self.sanityRecoveryIdentifier])
+
+            let content = UNMutableNotificationContent()
+            content.title = title
+            if let body, !body.isEmpty {
+                content.body = body
+            }
+            if sound {
+                content.sound = .default
+            }
+
+            let components = Calendar.current.dateComponents(
+                [.year, .month, .day, .hour, .minute, .second],
+                from: date
+            )
+            let trigger = UNCalendarNotificationTrigger(dateMatching: components, repeats: false)
+            let request = UNNotificationRequest(
+                identifier: Self.sanityRecoveryIdentifier,
+                content: content,
+                trigger: trigger
+            )
+            center.add(request)
+        }
+    }
+}
+
+extension MAANotificationCenter: UNUserNotificationCenterDelegate {
+    /// 应用为当前活跃 App 时不重复弹系统横幅（App 内日志已同步展示），
+    /// 否则以横幅 + 声音展示通知。
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        if NSApp.isActive {
+            completionHandler([])
+        } else {
+            completionHandler([.banner, .sound])
+        }
     }
 }
