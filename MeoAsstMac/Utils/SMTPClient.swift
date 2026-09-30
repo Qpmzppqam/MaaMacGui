@@ -71,7 +71,7 @@ enum SMTPClient {
             if capabilities.uppercased().contains("STARTTLS") {
                 try sendCommand(connection, "STARTTLS")
                 try expect(connection, acceptedCode: 220)
-                try connection.startTLSAndHandshake()
+                try connection.startTLSAndHandshake(host: request.host)
                 try sendCommand(connection, "EHLO \(ProcessInfo.processInfo.hostName)")
                 _ = try readMultilineResponse(connection)
             }
@@ -136,13 +136,17 @@ enum SMTPClient {
         mail += "Content-Transfer-Encoding: base64\r\n"
         mail += "\r\n"
         mail += bodyEncoded
-        mail += "\r\n."
 
-        // Dot-stuffing：正文行首为「.」时按 RFC 5321 加倍，防止提前结束 DATA。
+        // Dot-stuffing：内容行首为「.」时按 RFC 5321 加倍，防止提前结束 DATA。
+        // 必须在追加终止符之前进行——若终止符「.」也参与 stuffing 会被改写成「..」，
+        // 服务器将永远等不到 DATA 结束。
         mail = mail
             .split(separator: "\r\n", omittingEmptySubsequences: false)
             .map { $0.hasPrefix(".") ? "." + $0 : String($0) }
             .joined(separator: "\r\n")
+
+        // 终止符独立成行并自行结束该行（<CRLF>.<CRLF>），随后才能发送下一命令。
+        mail += "\r\n.\r\n"
 
         try connection.write(Data(mail.utf8))
     }
@@ -212,7 +216,7 @@ enum SMTPClient {
                 try establishSocket(fd, candidate)
                 let connection = Connection(fd: fd)
                 if useSSL {
-                    try connection.startTLSAndHandshake()
+                    try connection.startTLSAndHandshake(host: host)
                 }
                 return connection
             } catch {
@@ -273,7 +277,9 @@ final class Connection {
     }
 
     /// 将现有明文连接就地升级为 TLS 并完成握手。
-    func startTLSAndHandshake() throws {
+    /// - Parameter host: 预期的 SMTP 主机名，用于证书 SAN/CN 匹配；
+    ///   缺省时受信任 CA 签发的任意域名证书都会通过校验（主机名不匹配 MITM）。
+    func startTLSAndHandshake(host: String) throws {
         guard let context = SSLCreateContext(nil, .clientSide, .streamType) else {
             throw SMTPError.tlsHandshakeFailed
         }
@@ -290,6 +296,12 @@ final class Connection {
             { connectionRef, data, dataLength in
                 Connection.sslWrite(connectionRef: connectionRef, buffer: data, total: dataLength)
             })
+
+        // 设置预期主机名：SSLCopyPeerTrust 产出的 trust 将据此执行 SAN/CN 匹配。
+        let setStatus = SSLSetPeerDomainName(context, host, host.utf8.count)
+        guard setStatus == noErr else {
+            throw SMTPError.tlsHandshakeFailed
+        }
 
         // 启用系统信任链校验：握手在服务器证书验证完成处中断，交由 SecTrust 复核。
         SSLSetSessionOption(context, .breakOnServerAuth, true)

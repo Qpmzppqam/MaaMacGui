@@ -223,7 +223,8 @@ struct DiscordProvider: ExternalNotificationSending {
         guard let channelId = await createDMChannel(botToken: config.discordBotToken, userId: config.discordUserID) else {
             return false
         }
-        return await sendMessage(botToken: config.discordBotToken, channelId: channelId, message: content)
+        // 与其他渠道一致携带事件标题（WPF 版仅发送 content，此处为体验改进）。
+        return await sendMessage(botToken: config.discordBotToken, channelId: channelId, message: "\(title): \(content)")
     }
 
     private func createDMChannel(botToken: String, userId: String) async -> String? {
@@ -593,10 +594,12 @@ struct SMTPProvider: ExternalNotificationSending {
 
     /// 把 `[时间][颜色]内容` 形式的日志行重排为带颜色的 HTML span；
     /// 时间戳统一用 trace 色，正文颜色与 GUI 日志配色一致。
+    /// 日志内容可能来自 Core 输出或用户自定义配置（如基建计划描述），
+    /// 嵌入 HTML 前必须转义，否则会破坏邮件 DOM 结构。
     private static func processContent(_ content: String) -> String {
         let matches = DetailedLog.matches(in: content)
         if matches.isEmpty {
-            return content
+            return htmlEscape(content)
         }
 
         var result = content
@@ -609,10 +612,17 @@ struct SMTPProvider: ExternalNotificationSending {
             guard let logColor = MAALog.LogColor(resourceKey: colorCode) else { continue }
             guard let fullRange = Range(match.range, in: result) else { continue }
             let replacement =
-                "<span style='color: \(traceColor);'>\(time)  </span><span style='color: \(rgbColor(for: logColor));'>\(contentText)</span>"
+                "<span style='color: \(traceColor);'>\(htmlEscape(time))  </span><span style='color: \(rgbColor(for: logColor));'>\(htmlEscape(contentText))</span>"
             result.replaceSubrange(fullRange, with: replacement)
         }
         return result
+    }
+
+    private static func htmlEscape(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
     }
 
     private static func rgbColor(for color: MAALog.LogColor) -> String? {
